@@ -1,5 +1,6 @@
 from tqdm import tqdm
 import pandas as pd
+import itertools
 import os
 import re
 import sys
@@ -189,17 +190,17 @@ def build_messages(prompt, system_prompt):
     return messages
 
 
-def get_ollama_client():
+def get_ollama_clients(endpoints=None):
     if OpenAI is None:
         raise ImportError(
             "The 'openai' package is required for --backend ollama. "
             "Install it with: pip install openai"
         )
 
-    return OpenAI(
-        base_url="http://localhost:11434/v1",
-        api_key="ollama",  # required by the client but ignored by Ollama
-    )
+    if not endpoints:
+        endpoints = ["http://localhost:11434/v1"]
+
+    return [OpenAI(base_url=url, api_key="ollama") for url in endpoints]
 
 
 def render_chat_prompt(tokenizer, messages):
@@ -215,9 +216,16 @@ def render_chat_prompt(tokenizer, messages):
 
 def build_generator(args, system_prompt):
     if args.backend == "ollama":
-        client = get_ollama_client()
+        endpoints = None
+        if args.ollama_endpoints:
+            endpoints = [u.strip() for u in args.ollama_endpoints.split(",") if u.strip()]
+        clients = get_ollama_clients(endpoints)
+        counter = itertools.count()
+        if len(clients) > 1:
+            print(f"[ollama] Round-robin across {len(clients)} endpoints: {[c.base_url for c in clients]}")
 
         def generate_text(prompt):
+            client = clients[next(counter) % len(clients)]
             request_kwargs = {
                 "model": args.model,
                 "messages": build_messages(prompt, system_prompt),
@@ -564,6 +572,12 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of concurrent in-flight generation requests (Ollama backend only). Should match OLLAMA_NUM_PARALLEL.",
+    )
+    parser.add_argument(
+        "--ollama_endpoints",
+        type=str,
+        default=None,
+        help="Comma-separated Ollama OpenAI-compatible base URLs to round-robin across (e.g. http://127.0.0.1:11434/v1,http://127.0.0.1:11435/v1). Defaults to a single localhost:11434 endpoint.",
     )
     args = parser.parse_args()
 
