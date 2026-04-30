@@ -4,6 +4,8 @@ import os
 import re
 import sys
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
@@ -416,13 +418,22 @@ def main(args):
 
     text_generator = build_generator(args, system_prompt)
 
-    # Process each row, saving a checkpoint every 50 rows
-    CHECKPOINT_EVERY = 50
-    for i, row in enumerate(tqdm(df[prompt_column], desc=f"Running {args.model}", total=len(df))):
-        existing_output = df.iloc[i][args.output_column]
-        if not is_retryable_existing_output(existing_output):
-            continue
-        prompt = row if template_mode else format_prompt(row, args.AITA_binary)
+    concurrency = max(1, args.concurrency)
+    if concurrency > 1 and args.backend != "ollama":
+        print(
+            f"--concurrency {concurrency} is only supported with --backend ollama; "
+            "falling back to concurrency=1."
+        )
+        concurrency = 1
+
+    pending_indices = [
+        i for i in range(len(df))
+        if is_retryable_existing_output(df.iloc[i][args.output_column])
+    ]
+
+    def process_index(i):
+        row_value = df.iloc[i][prompt_column]
+        prompt = row_value if template_mode else format_prompt(row_value, args.AITA_binary)
         try:
             raw_output = text_generator(prompt)
             if raw_output == "":
@@ -439,13 +450,22 @@ def main(args):
         except Exception as e:
             raw_output = f"[ERROR] {e}"
             output = f"[ERROR] {e}"
-        if args.raw_output_column is not None:
-            df.at[df.index[i], args.raw_output_column] = raw_output
-        df.at[df.index[i], args.output_column] = output
+        return i, raw_output, output
 
-        # Save checkpoint periodically
-        if (i + 1) % CHECKPOINT_EVERY == 0:
-            df.to_csv(args.output_file, index=False)
+    CHECKPOINT_EVERY = 50
+    df_lock = threading.Lock()
+    completed = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(process_index, i) for i in pending_indices]
+        for future in tqdm(as_completed(futures), total=len(futures), desc=f"Running {args.model}"):
+            i, raw_output, output = future.result()
+            with df_lock:
+                if args.raw_output_column is not None:
+                    df.at[df.index[i], args.raw_output_column] = raw_output
+                df.at[df.index[i], args.output_column] = output
+                completed += 1
+                if completed % CHECKPOINT_EVERY == 0:
+                    df.to_csv(args.output_file, index=False)
 
     df.to_csv(args.output_file, index=False)
     print(f"Saved output to {args.output_file}")
@@ -538,6 +558,12 @@ if __name__ == "__main__":
         "--fail_on_unparsed_label",
         action="store_true",
         help="If label normalization cannot find a valid label, store an [ERROR] marker instead of the raw response.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of concurrent in-flight generation requests (Ollama backend only). Should match OLLAMA_NUM_PARALLEL.",
     )
     args = parser.parse_args()
 

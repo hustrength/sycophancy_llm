@@ -1,4 +1,6 @@
-import argparse, subprocess, sys
+import argparse, os, subprocess, sys, time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +46,121 @@ def run_command(command, dry_run=False):
         subprocess.run(command, check=True, cwd=ROOT)
 
 
+OLLAMA_LOG = ROOT / "logs" / "ollama_serve.log"
+
+
+def restart_ollama_serve(concurrency, ready_timeout=30):
+    print("[ollama] --restart_ollama: stopping existing 'ollama' processes (pkill -x ollama)...")
+    print("[ollama] If Ollama.app is running on macOS, quit it from the menu bar first or it may respawn the daemon.")
+    subprocess.run(["pkill", "-x", "ollama"], check=False)
+    time.sleep(1.5)
+
+    OLLAMA_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(OLLAMA_LOG, "a")
+
+    env = os.environ.copy()
+    env["OLLAMA_NUM_PARALLEL"] = str(concurrency)
+
+    print(f"[ollama] Launching 'ollama serve' with OLLAMA_NUM_PARALLEL={concurrency} (logs: {OLLAMA_LOG})...")
+    try:
+        proc = subprocess.Popen(
+            ["ollama", "serve"],
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "The 'ollama' CLI was not found on PATH. Install Ollama from https://ollama.com."
+        ) from exc
+
+    deadline = time.time() + ready_timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2) as resp:
+                if resp.status == 200:
+                    print(f"[ollama] Server is ready (pid={proc.pid}). It will keep running after this script exits.")
+                    return
+        except (urllib.error.URLError, ConnectionError, OSError):
+            time.sleep(0.5)
+
+    raise RuntimeError(
+        f"ollama serve did not become ready within {ready_timeout}s. Check the log at {OLLAMA_LOG}."
+    )
+
+
+def ensure_ollama_parallel(concurrency):
+    raw_current = os.environ.get("OLLAMA_NUM_PARALLEL")
+    try:
+        current_int = int(raw_current) if raw_current is not None else None
+    except ValueError:
+        current_int = None
+
+    os.environ["OLLAMA_NUM_PARALLEL"] = str(concurrency)
+
+    if current_int is not None and current_int >= concurrency:
+        print(f"[ollama] OLLAMA_NUM_PARALLEL={current_int} (>= --concurrency={concurrency}).")
+        return
+
+    if raw_current is None:
+        print(
+            f"[ollama] OLLAMA_NUM_PARALLEL is unset in this shell; setting it to {concurrency} "
+            "for child processes spawned by this script.\n"
+            "[ollama] NOTE: an already-running 'ollama serve' will NOT pick this up. "
+            f"For real parallelism, restart it with:  OLLAMA_NUM_PARALLEL={concurrency} ollama serve"
+        )
+    else:
+        print(
+            f"[ollama] OLLAMA_NUM_PARALLEL was '{raw_current}', overriding to {concurrency} "
+            "for child processes spawned by this script.\n"
+            f"[ollama] Restart 'ollama serve' with OLLAMA_NUM_PARALLEL={concurrency} for it to take effect."
+        )
+
+
+def ensure_ollama_models(models, dry_run=False):
+    try:
+        result = subprocess.run(
+            ["ollama", "list"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "The 'ollama' CLI was not found on PATH. Install Ollama from https://ollama.com "
+            "or use --generation_backend transformers."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        raise RuntimeError(
+            "Failed to query Ollama (is the Ollama service running? Try `ollama serve`). "
+            f"`ollama list` exited with status {exc.returncode}: {stderr}"
+        ) from exc
+
+    available = set()
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.split()
+        if parts:
+            available.add(parts[0])
+
+    for model_name in models:
+        if model_name in available:
+            print(f"[ollama] Model '{model_name}' already available.")
+            continue
+        print(f"[ollama] Model '{model_name}' not found locally. Pulling...")
+        if dry_run:
+            print(f"  (dry run) would execute: ollama pull {model_name}")
+            continue
+        try:
+            subprocess.run(["ollama", "pull", model_name], check=True)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"`ollama pull {model_name}` failed with status {exc.returncode}. "
+                "Check the model name at https://ollama.com/library."
+            ) from exc
+
+
 def build_generate_command(args, dataset, variant, model_name):
     output_suffix = "_rationale" if (args.oeq_short_rationale and dataset == "oeq") else ""
     output_file = ROOT / "outputs" / "generations" / f"{dataset}_{model_tag(model_name)}{output_suffix}.csv"
@@ -77,6 +194,8 @@ def build_generate_command(args, dataset, variant, model_name):
         command += ["--row_indices", args.row_indices]
     if raw_output_col is not None:
         command += ["--raw_output_column", raw_output_col, "--oeq_short_rationale", "--fail_on_unparsed_label"]
+    if args.concurrency is not None and args.concurrency > 1:
+        command += ["--concurrency", str(args.concurrency)]
     return command, output_file, prompt_col, response_col, raw_output_col
 
 
@@ -107,6 +226,12 @@ def build_judge_command(args, dataset, variant, model_name, gen_file, prompt_col
 def main(args):
     datasets = expand_requested(args.datasets, PROMPT_TEMPLATES.keys())
     models = parse_list(args.models)
+    if args.generation_backend == "ollama":
+        if args.restart_ollama:
+            restart_ollama_serve(max(1, args.concurrency))
+        elif args.concurrency > 1:
+            ensure_ollama_parallel(args.concurrency)
+        ensure_ollama_models(models, dry_run=args.dry_run)
     for dataset in datasets:
         variants = expand_requested(args.variants, PROMPT_TEMPLATES[dataset].keys())
         for model_name in models:
@@ -149,4 +274,15 @@ if __name__ == "__main__":
     parser.add_argument("--judge_model", default=None, help="Optional override for judge model.")
     parser.add_argument("--judge_max_tokens", type=int, default=2, help="Judge max tokens.")
     parser.add_argument("--dry_run", action="store_true", help="Print commands without executing them.")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Concurrent in-flight requests per generation job (Ollama backend only). Should match OLLAMA_NUM_PARALLEL.",
+    )
+    parser.add_argument(
+        "--restart_ollama",
+        action="store_true",
+        help="Stop existing 'ollama' processes and restart 'ollama serve' as a background process with OLLAMA_NUM_PARALLEL=--concurrency. The new server keeps running after this script exits.",
+    )
     main(parser.parse_args())
