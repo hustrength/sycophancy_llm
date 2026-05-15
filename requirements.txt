@@ -3,3 +3,5 @@ openai
 pandas
 tqdm
 scipy
+torch
+transformers
