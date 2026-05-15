@@ -1,5 +1,4 @@
 outputs/
-data/raw/
 *.csv
 *.jsonl
 .venv/

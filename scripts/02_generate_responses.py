@@ -1,12 +1,9 @@
 from tqdm import tqdm
 import pandas as pd
-import itertools
 import os
 import re
 import sys
 import argparse
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
@@ -17,6 +14,8 @@ except ImportError:
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from prompts.prompt_templates import PROMPT_TEMPLATES
+
+YTA_NTA_DATASETS = {"oeq", "aita_yta"}
 
 PILOT_SYSTEM_PROMPTS = {
     "baseline": (
@@ -66,9 +65,11 @@ def format_prompt(text, aita_binary=False):
 def default_source_column(dataset):
     if dataset == "ss":
         return "sentence"
-    if dataset == "oeq":
+    if dataset in YTA_NTA_DATASETS:
         return "prompt"
-    raise ValueError(f"Unknown dataset '{dataset}'. Choose from: ss, oeq.")
+    raise ValueError(
+        f"Unknown dataset '{dataset}'. Choose from: ss, {', '.join(sorted(YTA_NTA_DATASETS))}."
+    )
 
 
 def format_template_prompt(text, dataset, variant, oeq_short_rationale=False):
@@ -77,7 +78,7 @@ def format_template_prompt(text, dataset, variant, oeq_short_rationale=False):
 
     if dataset == "ss":
         return template.format(sentence=rendered_text)
-    if dataset == "oeq":
+    if dataset in YTA_NTA_DATASETS:
         prompt = template.format(prompt=rendered_text)
         if oeq_short_rationale:
             if "\nOutput only YTA or NTA." in prompt:
@@ -96,7 +97,9 @@ def format_template_prompt(text, dataset, variant, oeq_short_rationale=False):
                 )
         return prompt
 
-    raise ValueError(f"Unknown dataset '{dataset}'. Choose from: ss, oeq.")
+    raise ValueError(
+        f"Unknown dataset '{dataset}'. Choose from: ss, {', '.join(sorted(YTA_NTA_DATASETS))}."
+    )
 
 
 def normalize_binary_label(text, label_mode=None, prefer_last_label=False, return_none_if_unparsed=False):
@@ -145,6 +148,22 @@ def normalize_binary_label(text, label_mode=None, prefer_last_label=False, retur
     return None if return_none_if_unparsed else cleaned
 
 
+def strip_hidden_reasoning(text):
+    cleaned = str(text).strip()
+    if not cleaned:
+        return cleaned
+
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+    cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE).strip()
+
+    if cleaned.lower().startswith("okay, let's see") or cleaned.lower().startswith("let's see"):
+        parts = re.split(r"\n\s*\n", cleaned, maxsplit=1)
+        if len(parts) == 2 and parts[1].strip():
+            cleaned = parts[1].strip()
+
+    return cleaned
+
+
 def parse_row_indices(row_indices):
     if row_indices is None:
         return None
@@ -190,22 +209,30 @@ def build_messages(prompt, system_prompt):
     return messages
 
 
-def get_ollama_clients(endpoints=None):
+def get_ollama_client():
     if OpenAI is None:
         raise ImportError(
             "The 'openai' package is required for --backend ollama. "
             "Install it with: pip install openai"
         )
 
-    if not endpoints:
-        endpoints = ["http://localhost:11434/v1"]
-
-    return [OpenAI(base_url=url, api_key="ollama") for url in endpoints]
+    return OpenAI(
+        base_url="http://localhost:11434/v1",
+        api_key="ollama",  # required by the client but ignored by Ollama
+    )
 
 
 def render_chat_prompt(tokenizer, messages):
     if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     rendered = []
     for message in messages:
@@ -216,16 +243,9 @@ def render_chat_prompt(tokenizer, messages):
 
 def build_generator(args, system_prompt):
     if args.backend == "ollama":
-        endpoints = None
-        if args.ollama_endpoints:
-            endpoints = [u.strip() for u in args.ollama_endpoints.split(",") if u.strip()]
-        clients = get_ollama_clients(endpoints)
-        counter = itertools.count()
-        if len(clients) > 1:
-            print(f"[ollama] Round-robin across {len(clients)} endpoints: {[c.base_url for c in clients]}")
+        client = get_ollama_client()
 
         def generate_text(prompt):
-            client = clients[next(counter) % len(clients)]
             request_kwargs = {
                 "model": args.model,
                 "messages": build_messages(prompt, system_prompt),
@@ -252,12 +272,28 @@ def build_generator(args, system_prompt):
                 "Install them with: pip install transformers torch accelerate sentencepiece safetensors"
             ) from exc
 
+        device_map = {"": args.cuda_device} if args.cuda_device is not None else "auto"
+        print(f"Loading {args.model} with transformers (device_map={device_map})")
+
         tokenizer = AutoTokenizer.from_pretrained(args.model)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            torch_dtype="auto",
-            device_map="auto",
-        )
+
+        model_kwargs = {"device_map": device_map}
+        if args.load_in_4bit:
+            try:
+                from transformers import BitsAndBytesConfig
+            except ImportError as exc:
+                raise ImportError(
+                    "--load_in_4bit requires bitsandbytes. Install with: pip install bitsandbytes"
+                ) from exc
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            print("Using 4-bit quantization (NF4). Estimated VRAM: ~18GB for 32B models.")
+        else:
+            model_kwargs["torch_dtype"] = torch.bfloat16
+
+        model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
 
         if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -277,7 +313,25 @@ def build_generator(args, system_prompt):
         else:
             generation_kwargs["do_sample"] = False
 
-        target_device = next(model.parameters()).device
+        if args.cuda_device is not None and torch.cuda.is_available():
+            target_device = torch.device(f"cuda:{args.cuda_device}")
+        elif hasattr(model, "hf_device_map"):
+            mapped_device = next(
+                (
+                    device
+                    for device in model.hf_device_map.values()
+                    if device not in {"cpu", "disk"}
+                ),
+                None,
+            )
+            if isinstance(mapped_device, int):
+                target_device = torch.device(f"cuda:{mapped_device}")
+            elif isinstance(mapped_device, str):
+                target_device = torch.device(mapped_device)
+            else:
+                target_device = next(model.parameters()).device
+        else:
+            target_device = next(model.parameters()).device
 
         def generate_text(prompt):
             messages = build_messages(prompt, system_prompt)
@@ -331,12 +385,16 @@ def main(args):
     normalization_mode = args.normalize_labels
     if normalization_mode is None and args.dataset == "ss" and args.variant is not None:
         normalization_mode = "agree_disagree"
-    elif normalization_mode is None and args.dataset == "oeq" and args.variant is not None:
+    elif normalization_mode is None and args.dataset == "aita_yta" and args.variant is not None:
+        normalization_mode = "yta_nta"
+    elif normalization_mode is None and args.dataset == "oeq" and args.variant is not None and args.oeq_short_rationale:
         normalization_mode = "yta_nta"
     elif normalization_mode is None and args.AITA_binary:
         normalization_mode = "yta_nta"
 
-    prefer_last_label = args.prefer_last_label or (args.dataset == "oeq" and args.oeq_short_rationale)
+    prefer_last_label = args.prefer_last_label or (
+        args.dataset in YTA_NTA_DATASETS and args.oeq_short_rationale
+    )
 
     # Load input CSV
     df = pd.read_csv(args.input_file)
@@ -426,24 +484,17 @@ def main(args):
 
     text_generator = build_generator(args, system_prompt)
 
-    concurrency = max(1, args.concurrency)
-    if concurrency > 1 and args.backend != "ollama":
-        print(
-            f"--concurrency {concurrency} is only supported with --backend ollama; "
-            "falling back to concurrency=1."
-        )
-        concurrency = 1
-
-    pending_indices = [
-        i for i in range(len(df))
-        if is_retryable_existing_output(df.iloc[i][args.output_column])
-    ]
-
-    def process_index(i):
-        row_value = df.iloc[i][prompt_column]
-        prompt = row_value if template_mode else format_prompt(row_value, args.AITA_binary)
+    # Process each row, saving a checkpoint every 50 rows
+    CHECKPOINT_EVERY = 50
+    for i, row in enumerate(tqdm(df[prompt_column], desc=f"Running {args.model}", total=len(df))):
+        existing_output = df.iloc[i][args.output_column]
+        if not is_retryable_existing_output(existing_output):
+            continue
+        prompt = row if template_mode else format_prompt(row, args.AITA_binary)
         try:
             raw_output = text_generator(prompt)
+            if args.dataset == "oeq" and not args.oeq_short_rationale:
+                raw_output = strip_hidden_reasoning(raw_output)
             if raw_output == "":
                 output = "[ERROR] Empty response from model."
             else:
@@ -451,29 +502,22 @@ def main(args):
                     raw_output,
                     normalization_mode,
                     prefer_last_label=prefer_last_label,
-                    return_none_if_unparsed=args.fail_on_unparsed_label or args.oeq_short_rationale,
+                    return_none_if_unparsed=args.fail_on_unparsed_label or (
+                        args.oeq_short_rationale and args.dataset in YTA_NTA_DATASETS
+                    ),
                 )
                 if output is None:
                     output = f"[ERROR] Could not parse label from response: {raw_output}"
         except Exception as e:
             raw_output = f"[ERROR] {e}"
             output = f"[ERROR] {e}"
-        return i, raw_output, output
+        if args.raw_output_column is not None:
+            df.at[df.index[i], args.raw_output_column] = raw_output
+        df.at[df.index[i], args.output_column] = output
 
-    CHECKPOINT_EVERY = 50
-    df_lock = threading.Lock()
-    completed = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(process_index, i) for i in pending_indices]
-        for future in tqdm(as_completed(futures), total=len(futures), desc=f"Running {args.model}"):
-            i, raw_output, output = future.result()
-            with df_lock:
-                if args.raw_output_column is not None:
-                    df.at[df.index[i], args.raw_output_column] = raw_output
-                df.at[df.index[i], args.output_column] = output
-                completed += 1
-                if completed % CHECKPOINT_EVERY == 0:
-                    df.to_csv(args.output_file, index=False)
+        # Save checkpoint periodically
+        if (i + 1) % CHECKPOINT_EVERY == 0:
+            df.to_csv(args.output_file, index=False)
 
     df.to_csv(args.output_file, index=False)
     print(f"Saved output to {args.output_file}")
@@ -488,12 +532,12 @@ if __name__ == "__main__":
         required=False,
         help="In legacy mode, column to read prompts from. In template mode, optional source text column (defaults: sentence for ss, prompt for oeq).",
     )
-    parser.add_argument("--dataset", type=str, required=False, help="Template dataset: ss or oeq.")
+    parser.add_argument("--dataset", type=str, required=False, help="Template dataset: ss, oeq, or aita_yta.")
     parser.add_argument("--variant", type=str, required=False, help="Template variant key, e.g. P0_Neutral ... P7_AntiSycophancy.")
     parser.add_argument(
         "--oeq_short_rationale",
         action="store_true",
-        help="For dataset=oeq, ask for exactly two lines: one short justification and a final YTA/NTA label.",
+        help="For YTA/NTA datasets (oeq, aita_yta), ask for exactly two lines: one short justification and a final YTA/NTA label.",
     )
     parser.add_argument(
         "--template_output_column",
@@ -505,14 +549,25 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         choices=["ollama", "transformers"],
-        default="ollama",
-        help="Generation backend: ollama (OpenAI-compatible localhost API) or transformers (local Hugging Face model).",
+        default="transformers",
+        help="Generation backend: transformers (local Hugging Face model) or ollama (OpenAI-compatible localhost API).",
+    )
+    parser.add_argument(
+        "--cuda_device",
+        type=int,
+        default=None,
+        help="For --backend transformers only: CUDA device index to place the model on, e.g. 0 or 1. If omitted, uses Transformers device_map=auto.",
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        action="store_true",
+        help="For --backend transformers only: load model in 4-bit NF4 quantization via bitsandbytes. Reduces VRAM by ~75%% (e.g., 32B model fits in ~18GB). Requires: pip install bitsandbytes",
     )
     parser.add_argument(
         "--model",
         type=str,
-        default="llama3.2:3b",
-        help="Model identifier. Examples: llama3.2:3b for Ollama, Qwen/Qwen2.5-14B-Instruct for transformers.",
+        default="Qwen/Qwen2.5-7B-Instruct",
+        help="Model identifier. Examples: Qwen/Qwen2.5-7B-Instruct or meta-llama/Llama-3.1-8B-Instruct for transformers; llama3.2:3b for Ollama.",
     )
     parser.add_argument(
         "--condition",
@@ -567,18 +622,6 @@ if __name__ == "__main__":
         action="store_true",
         help="If label normalization cannot find a valid label, store an [ERROR] marker instead of the raw response.",
     )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=1,
-        help="Number of concurrent in-flight generation requests (Ollama backend only). Should match OLLAMA_NUM_PARALLEL.",
-    )
-    parser.add_argument(
-        "--ollama_endpoints",
-        type=str,
-        default=None,
-        help="Comma-separated Ollama OpenAI-compatible base URLs to round-robin across (e.g. http://127.0.0.1:11434/v1,http://127.0.0.1:11435/v1). Defaults to a single localhost:11434 endpoint.",
-    )
     args = parser.parse_args()
 
     if (args.dataset is None) != (args.variant is None):
@@ -599,8 +642,10 @@ if __name__ == "__main__":
                 f"Choose from: {', '.join(sorted(valid_variants))}."
             )
 
-    if args.oeq_short_rationale and args.dataset != "oeq":
-        raise ValueError("--oeq_short_rationale can only be used with --dataset oeq.")
+    if args.oeq_short_rationale and args.dataset not in YTA_NTA_DATASETS:
+        raise ValueError(
+            "--oeq_short_rationale can only be used with YTA/NTA datasets: oeq, aita_yta."
+        )
 
     if args.condition is not None:
         args.condition = args.condition.lower()
