@@ -1,5 +1,4 @@
 outputs/
-*.csv
 *.jsonl
 .venv/
 __pycache__/
