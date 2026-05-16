@@ -291,7 +291,10 @@ def build_generator(args, system_prompt):
             )
             print("Using 4-bit quantization (NF4). Estimated VRAM: ~18GB for 32B models.")
         else:
-            model_kwargs["torch_dtype"] = torch.bfloat16
+            model_kwargs["dtype"] = torch.bfloat16
+
+        if args.attn_implementation:
+            model_kwargs["attn_implementation"] = args.attn_implementation
 
         model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
 
@@ -562,6 +565,13 @@ if __name__ == "__main__":
         "--load_in_4bit",
         action="store_true",
         help="For --backend transformers only: load model in 4-bit NF4 quantization via bitsandbytes. Reduces VRAM by ~75%% (e.g., 32B model fits in ~18GB). Requires: pip install bitsandbytes",
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default=None,
+        choices=["flash_attention_2", "sdpa", "eager"],
+        help="For --backend transformers only: attention implementation. Use flash_attention_2 to maximize Tensor Core utilization. Requires: pip install flash-attn --no-build-isolation",
     )
     parser.add_argument(
         "--model",
